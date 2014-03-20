@@ -1,0 +1,9 @@
+auth:
+  username: transiflex_user
+  password: transiflex_password
+project:
+  name: discourse-pt-br
+  resource: clientenyml
+  language: de
+api:
+  url: http://www.transifex.com/api/2/project/%project%/resource/%resource%/translation/%language%/strings/?details

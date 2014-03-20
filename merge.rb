@@ -1,160 +1,166 @@
 #!/usr/bin/ruby
-require 'yaml'
+require_relative './YamlEntity'
+require_relative './YamlParser'
+require_relative './GithubMeta'
+require_relative './TransifexApi'
 
 if ARGV.length < 3 || ARGV.length > 4
-  puts "Usage: ./merge.rb ./transiflex.yml ./github.yml [./english.yml] ./output.yml"
-  puts "If an english translation is given, interactive merge process is activated. Otherwise transiflex.yml translation is used in case of conflict."
+  puts "Usage: ./merge.rb ./transifex.yml ./github.yml [./english.yml] ./output.yml"
+  puts "If an english translation is given, interactive merge process is activated. Otherwise the most up-to-date translation is used in case of conflict."
   exit 1
 end
 
-interactiveMerge = ARGV.length == 4
-fileInput = ARGV[0]
-fileAlt = ARGV[1]
-fileSource = interactiveMerge ? ARGV[2] : nil
-fileOutput = interactiveMerge ? ARGV[3] : ARGV[2]
+countStrings = 0
+countEmpty = 0
+countConflict = 0
+countGithub = 0
+countTransifex = 0
+countConflictTransiflex = 0
 
-compareDoc = YAML.load_file(fileAlt) or die "Unable to open '"+fileAlt+"'"
+interactiveMerge = ARGV.length == 4
+filenameTransifex = ARGV[0]
+filenameGithub = ARGV[1]
+filenameOrigin = interactiveMerge ? ARGV[2] : nil
+filenameOutput = interactiveMerge ? ARGV[3] : ARGV[2]
+
+fileTransifex = File.open(filenameTransifex,"r:UTF-8") or die "Unable to open file: " + filenameTransifex 
+fileGithub = File.open(filenameGithub,"r:UTF-8") or die "Unable to open file: " + filenameGithub
 
 if interactiveMerge
-  origDoc = YAML.load_file(fileSource) or die "Unable to open '"+fileSource+"'"
+  fileOrigin = File.open(filenameOrigin,"r:UTF-8") or die "Unable to open file: " + filenameOrigin
 end
 
-f = File.open(fileInput,"r:UTF-8") or die "Unable to open file..."
-contentArray=[]
-pathStack=[]
+linesTransifex = []
+fileTransifex.each_line {|line|
+  linesTransifex.push line
+}
 
-countEmpty = 0
-countUsed = 0
-countSolvedConflicts = 0
-countKeep = 0
-countDups = 0
+linesGithub = []
+fileGithub.each_line {|line|
+  linesGithub.push line
+}
 
-
-regex_comment = /^ *#/
-regex_object = /^(?<indent> *)(?<identifier>[a-zA-Z0-9_+]+):$/
-regex_string = /^(?<indent> *)(?<identifier>[a-zA-Z0-9_+"]+): *(?<delim>['|"]?)(?<content>.*?)\k<delim>$/
-
-def getTranslation(document, path, altEntry = false)
-  doc = document
-  i = 0
-  for val in path
-    if altEntry && i == 0
-      doc = doc["en"]
-      i+=1
-      next
-    end
-    if doc[val]
-      doc = doc[val]
-    else
-      return nil
-    end
-  end
-  return doc
+if interactiveMerge
+  linesOrigin = []
+  fileOrigin.each_line {|line|
+    linesOrigin.push line
+  }
 end
 
-def prompt(orig, alt, pathStack, origDoc)
-  puts ("----Conflict: " + pathStack.join('.') + "----")
-  puts "1: "+orig
-  puts "2: "+alt
-  puts "Orig: "+getTranslation(origDoc, pathStack, true)
-  input = ''
-  while(!(input == '1' || input == '2'))
-    puts "Choose translation: "
-    input = $stdin.gets.chomp
-  end
-  if input == '1'
-    puts "Use: "+orig
-    return orig
+parserTransifex = YamlParser.new(linesTransifex)
+parseLinesTransifex, parseMapTransifex = parserTransifex.parse()
+
+parserGithub = YamlParser.new(linesGithub)
+parseLinesGithub, parseMapGithub = parserGithub.parse()
+
+if interactiveMerge
+  parserOrigin = YamlParser.new(linesOrigin)
+  parseLinesOrigin, parseMapOrigin = parserOrigin.parse()
+end
+
+githubMeta = GithubMeta.new(filenameGithub)
+transifexApi = TransifexApi.new('./transifex_config.yml')
+
+outputLines = []
+
+# Comparing
+parseLinesTransifex.each { |entityTransifex|
+  if entityTransifex.type != :string
+    outputLines.push(entityTransifex.raw)
   else
-    puts "Use: "+alt
-    return alt
-  end
-end
+    countStrings+=1
+    path = entityTransifex.path
+    dateTransifex = transifexApi.get(path)
+    entityGithub = parseMapGithub[path]
 
-f.each_line {|line|
-  line = line.chomp
-  if ((regex_comment =~ line) || (line.length == 0))
-    contentArray.push line
-  else
-    match_object = regex_object.match(line)
-    match_string = regex_string.match(line)
-    if match_object || match_string
-      indent = 0
+    # Github has translation, conflict incoming
+    if entityGithub && (!entityGithub.content.empty?)
+      dateGithub = githubMeta.date(entityGithub.line)
 
-      if match_object
-        indent = match_object[:indent].length.to_i / 2
-      else
-        indent = match_string[:indent].length.to_i / 2
-      end
+      # Check if there is a conflict
+      if ((!entityTransifex.content.empty?) && (entityTransifex.content != entityGithub.content))
+        countConflict+=1
 
-      while indent != pathStack.length
-        pathStack.pop
-      end
+        # Interactive merge
+        if interactiveMerge
 
-      if match_object
-        pathStack.push match_object[:identifier].gsub('"',"") 
-        contentArray.push line
-      else
-        if match_string
-          pathStack.push match_string[:identifier].gsub('"',"")
-          translation = getTranslation(compareDoc, pathStack)
-          delimiter = match_string[:delim]
-          if not delimiter
-            delimiter = "'"
+          # Get english version
+          pathOrigin = entityGithub.path.split(".")
+          pathOrigin.shift
+          pathOrigin = pathOrigin.insert(0, "en")
+          pathOrigin = pathOrigin.join(".")
+          contentOrigin = parseMapOrigin[pathOrigin]
+
+          puts "Path: " + entityGithub.path
+          if contentOrigin
+            puts "English: "+contentOrigin.content
+          end
+          puts "Transifex (1): "+entityTransifex.content
+          if dateTransifex
+            puts "Transifex Date: "+dateTransifex.iso8601
+          end
+          puts "Github (2): "+entityGithub.content
+          puts "Github Date: "+dateGithub.iso8601
+
+          # Prompt the user
+          input = -1
+          while(!(input == '1' || input == '2'))
+            puts "Choose translation: 1 or 2"
+            input = $stdin.gets.chomp
           end
 
-          # no translation
-          if match_string[:content].empty?
-            if translation && ! translation.empty?
-              countUsed+=1
-              contentArray.push(match_string[:indent]+match_string[:identifier]+": "+delimiter+translation+delimiter)
-            else # keep empty translation
-              countEmpty+=1
-              contentArray.push(match_string[:indent]+match_string[:identifier]+": "+delimiter+delimiter)
-            end
-          else # translation already exists
-            
-            # alternate translation not found
-            if translation && translation.empty?
-              # keep original translation
-              countKeep+=1
-              contentArray.push(match_string[:indent]+match_string[:identifier]+": "+delimiter+match_string[:content]+delimiter)
+          if input == '1'
+            countTransifex+=1
+            outputLines.push(entityTransifex.raw)
+          else
+            countGithub+=1
+            outputLines.push(entityGithub.raw)
+          end
+        else # Automatic merge
+          if dateTransifex
+            if dateTransifex > dateGithub
+              countTransifex+=1
+              countConflictTransiflex+=1
+              outputLines.push(entityTransifex.raw)
+              if entityTransifex.content.empty?
+                countEmpty+=1
+              end
             else
-              # ask which translation to use
-              if match_string[:content] != translation
-                countSolvedConflicts+=1
-                if interactiveMerge
-                  content = prompt(match_string[:content], translation, pathStack, origDoc)
-                else
-                  content = match_string[:content]
-                end
-                contentArray.push(match_string[:indent]+match_string[:identifier]+": "+match_string[:delim]+content+match_string[:delim])
-              else
-                countDups+=1
-                contentArray.push(match_string[:indent]+match_string[:identifier]+": "+match_string[:delim]+match_string[:content]+match_string[:delim])
+              countGithub+=1
+              outputLines.push(entityGithub.raw)
+              if entityGithub.content.empty?
+                countEmpty+=1
               end
             end
+          else
+
           end
-          pathStack.pop
+        end
+      else # Use github
+        countGithub+=1
+        outputLines.push(entityGithub.raw)
+        if entityGithub.content.empty?
+          countEmpty+=1
         end
       end
-    else
-      puts "Line could not be parsed"
-      puts "'"+line+"'", line.length
+
+    else # No github, no conflict
+      countTransifex+=1
+      outputLines.push(entityTransifex.raw)
+      if entityTransifex.content.empty?
+        countEmpty+=1
+      end
     end
+
   end
 }
 
-File.open(fileOutput, 'w') { |file|
-  file.write(contentArray.join("\n")+"\n") 
-}
+fileOutput = File.open(filenameOutput,"w:UTF-8") or die "Unable to open file: " + filenameOutput
+fileOutput.write(outputLines.join("\n")+"\n")
 
-# for newline in contentArray
-#   puts newline
-# end
-
-puts "Keep original: "+countKeep.to_s
-puts "Dups: "+countDups.to_s
+puts "Strings: "+countStrings.to_s
+puts "Used Github: "+countGithub.to_s
+puts "Used Transifex: "+countTransifex.to_s
+puts "Conflicts but Transiflex newer: " + countConflictTransiflex.to_s
+puts "Conflicts solved: "+countConflict.to_s
 puts "Still empty: "+countEmpty.to_s
-puts "Alternative translation used: "+countUsed.to_s
-puts "Solved conflicts: "+countSolvedConflicts.to_s
